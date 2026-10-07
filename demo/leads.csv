@@ -1,0 +1,4 @@
+company_name,contact_name,email,phone,city,business_type,website,menu_text,notes,source
+Trattoria Il Girasole Demo,Giulia Rossi,giulia@girasole-demo.test,,Bologna,ristorante,https://girasole-demo.test,"Menu fittizio: tagliatelle al ragù, verdure di stagione, tagliere di formaggi","DATI FITTIZI per demo; nessun contatto reale",Demo fittizia CSV
+Locanda delle Colline Demo,Marco Bianchi,marco@colline-demo.test,,Modena,hotel,https://colline-demo.test,"Menu fittizio: colazione con yogurt e confetture, aperitivo con formaggi","DATI FITTIZI per demo; nessun contatto reale",Demo fittizia CSV
+Bistrot del Porto Demo,,,,Ravenna,bistrot,,"Menu fittizio: insalate, verdure grigliate, panini gourmet","DATI FITTIZI; email volutamente mancante",Demo fittizia CSV
