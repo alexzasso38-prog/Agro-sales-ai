@@ -20,6 +20,10 @@ export type Qualification = {
   hypotheses: string[];
   missing_data: string[];
   method: string;
+  product_fit?: number;
+  commercial_potential?: number;
+  confidence?: number;
+  total_score?: number;
 };
 export type Lead = {
   id: number;

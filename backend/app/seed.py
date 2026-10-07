@@ -8,7 +8,7 @@ from .services import audit, qualification, create_draft, make_handoff
 
 DEMO_PROFILE = {
     'company_name': 'Cascina Verde · azienda fittizia',
-    'description': 'DEMO: produttore immaginario di ortaggi, olio e conserve per la ristorazione.',
+    'description': 'DEMO: produttore immaginario di ortaggi, formaggi premium, olio EVO, salumi e conserve per la ristorazione.',
     'contact_name': 'Giulia Rossi (personaggio demo)', 'contact_email': 'giulia@cascinaverde.test', 'phone': '',
     'minimum_order': '€ 120', 'service_areas': ['Milano', 'Monza', 'Como'],
     'delivery_terms': 'Consegna il martedì e il venerdì; disponibilità da confermare prima dell’ordine.',
@@ -17,6 +17,8 @@ DEMO_PROFILE = {
         {'id': 'p1', 'name': 'Pomodori datterini', 'category': 'ortaggi', 'unit': 'kg', 'price': 3.8, 'description': 'Pomodori da filiera locale. Prodotto fittizio demo.'},
         {'id': 'p2', 'name': 'Olio extravergine', 'category': 'olio', 'unit': 'l', 'price': 12.5, 'description': 'Bottiglia da 1 litro. Prodotto fittizio demo.'},
         {'id': 'p3', 'name': 'Passata di pomodoro', 'category': 'conserve', 'unit': 'bottiglia', 'price': 3.2, 'description': 'Formato da 700 g. Prodotto fittizio demo.'},
+        {'id': 'demo-formaggi', 'name': 'Formaggi premium DEMO', 'category': 'formaggi', 'unit': 'kg', 'price': 18.0, 'description': 'Prodotto completamente fittizio per lo scenario campagne.'},
+        {'id': 'demo-salumi', 'name': 'Salumi artigianali DEMO', 'category': 'salumi', 'unit': 'kg', 'price': 22.0, 'description': 'Prodotto completamente fittizio per lo scenario campagne.'},
     ],
 }
 

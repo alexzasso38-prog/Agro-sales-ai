@@ -293,7 +293,7 @@ def _ai_schema(task: str) -> dict[str, Any]:
         return _object({"subject": text, "body": text, "handoff_required": {"type": "boolean"}, "reason": text})
     if task == "classify_reply":
         return _object({
-            "classification": {"type": "string", "enum": ["interested", "question", "rejection", "unsubscribe", "hard_bounce", "other"]},
+            "classification": {"type": "string", "enum": ["interested", "question", "objection", "rejection", "not_interested", "meeting_request", "out_of_office", "unsubscribe", "hard_bounce", "other"]},
             "handoff_required": {"type": "boolean"}, "reason": text,
             "extracted": _object({"needs": strings, "quantity": {"type": ["string", "null"]}, "timing": {"type": ["string", "null"]}}),
         })

@@ -56,6 +56,8 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, post } from "./api";
+import AutomationCenter from "./AutomationCenter";
+import HumanCloser from "./HumanCloser";
 import type {
   Appointment,
   Audit,
@@ -72,6 +74,8 @@ import type {
 } from "./types";
 
 type Page =
+  | "automations"
+  | "closer"
   | "dashboard"
   | "leads"
   | "drafts"
@@ -84,6 +88,8 @@ type Page =
   | "audit";
 type Modal = "lead" | "search" | "appointment" | "reply" | "draft" | null;
 const pageNames: Record<Page, string> = {
+  automations: "Automazioni AI",
+  closer: "Human Closer",
   dashboard: "Panoramica",
   leads: "I tuoi lead",
   drafts: "Bozze da approvare",
@@ -97,12 +103,20 @@ const pageNames: Record<Page, string> = {
 };
 const stages: Record<string, string> = {
   new: "Nuovo",
+  discovered: "Trovato",
+  qualifying: "In valutazione",
   qualified: "Qualificato",
+  outreach_ready: "Bozza pronta",
   contacted: "Contattato",
+  follow_up: "Follow-up",
+  replied: "Ha risposto",
   interested: "Interessato",
+  meeting: "Incontro",
   appointment: "Appuntamento",
+  handoff: "Al commerciale",
   won: "Cliente",
   lost: "Perso",
+  do_not_contact: "Non contattare",
 };
 const statuses: Record<string, string> = {
   sending: "Invio in corso",
@@ -115,6 +129,7 @@ const statuses: Record<string, string> = {
   failed: "Errore",
   scheduled: "Programmata",
   processing: "In corso",
+  automation_managed: "Gestita dagli agenti",
   needs_approval: "Da approvare",
   completed: "Completata",
   simulated: "Simulato",
@@ -156,8 +171,9 @@ function Badge({
   return <span className={`badge ${tone}`}>{children}</span>;
 }
 function Stage({ value }: { value: string }) {
+  const normalized = value.toLowerCase();
   return (
-    <Badge tone={value}>{stages[value] || statuses[value] || value}</Badge>
+    <Badge tone={normalized}>{stages[normalized] || statuses[normalized] || value}</Badge>
   );
 }
 function Score({ value }: { value?: number | null }) {
@@ -387,7 +403,7 @@ function Auth({
           </p>
           <div className="auth-benefit">
             <ShieldCheck size={20} />
-            <span>Ogni messaggio passa dalla tua approvazione.</span>
+            <span>Il tuo controllo, a ogni passo della campagna.</span>
           </div>
         </div>
         <Landscape />
@@ -565,6 +581,7 @@ export default function App() {
     return () => document.removeEventListener("keydown", handleKey);
   }, [modal, lead, busy]);
   const load = useCallback(async () => {
+    const requestToken = sessionStorage.getItem("agro_token");
     const [
       dashboard,
       leads,
@@ -588,6 +605,7 @@ export default function App() {
       api<Profile>("/profile"),
       api<User>("/auth/me"),
     ]);
+    if (requestToken !== sessionStorage.getItem("agro_token")) return;
     setData({
       dashboard,
       leads,
@@ -610,6 +628,22 @@ export default function App() {
         .finally(() => setLoading(false));
     }
   }, [token, load]);
+  // Keep the existing CRM and dashboard in sync while campaign jobs run in the worker.
+  // Avoid refreshing profile inputs and open editors while the user is making changes.
+  useEffect(() => {
+    if (!token || busy || modal || ["profile", "integrations", "automations", "closer"].includes(page)) return;
+    let inFlight = false;
+    const timer = window.setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        await load();
+        if (lead) setLead(await api<Lead>(`/leads/${lead.id}`));
+      } catch { /* The next polling cycle can recover without replacing the open screen. */ }
+      finally { inFlight = false; }
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [token, busy, modal, page, load, lead?.id]);
   async function action(
     fn: () => Promise<unknown>,
     success: string | ((result: unknown) => { text: string; error?: boolean }),
@@ -672,6 +706,8 @@ export default function App() {
   const pending =
     data?.drafts.filter((item) => item.status === "pending").length || 0;
   const navItems: { id: Page; icon: ReactNode; badge?: number }[] = [
+    { id: "automations", icon: <Sparkles size={19} /> },
+    { id: "closer", icon: <Users size={19} />, badge: data?.handoffs.filter(h => h.status === "open").length },
     { id: "dashboard", icon: <LayoutDashboard size={19} /> },
     { id: "leads", icon: <Users size={19} /> },
     { id: "conversations", icon: <MessageSquare size={19} /> },
@@ -714,7 +750,7 @@ export default function App() {
           {navItems.map((item) => (
             <button
               key={item.id}
-              className={`nav-item ${page === item.id ? "active" : ""}`}
+              className={`nav-item ${page === item.id ? "active" : ""} ${item.id === "automations" ? "nav-automations" : ""}`}
               onClick={() => go(item.id)}
             >
               {item.icon}
@@ -844,6 +880,32 @@ export default function App() {
             />
           ) : data ? (
             <>
+              {page === "automations" && (
+                <AutomationCenter
+                  profile={data.profile}
+                  drafts={data.drafts}
+                  demo={!!meta?.demo_mode}
+                  onRefresh={load}
+                  onOpenLead={id => void openLead(id)}
+                  onOpenDraft={item => { setDraft(item); setModal("draft"); }}
+                  onCloser={() => go("closer")}
+                  notify={notify}
+                />
+              )}
+              {page === "closer" && (
+                <HumanCloser
+                  demo={!!meta?.demo_mode}
+                  onRefresh={load}
+                  onOpenLead={id => void openLead(id)}
+                  onContact={id => void action(async () => {
+                    const customer = await api<Lead>(`/leads/${id}`);
+                    const item = await post<Draft>(`/leads/${id}/draft`, { kind: customer.stop_reason === "reply" ? "reply" : "outreach" });
+                    setDraft(item); setModal("draft");
+                  }, "Messaggio preparato: rivedilo prima di approvare")}
+                  onAppointment={id => void action(async () => { setLead(await api<Lead>(`/leads/${id}`)); setModal("appointment"); }, "Verifica disponibilità e dettagli dell’incontro")}
+                  notify={notify}
+                />
+              )}
               {page === "dashboard" && (
                 <DashboardPage
                   data={data}
@@ -966,15 +1028,15 @@ export default function App() {
                   <PageHeader
                     eyebrow="OUTREACH CON IL TUO CONTROLLO"
                     title="Parole giuste, prima di inviare"
-                    text="Rivedi, personalizza e approva ogni messaggio."
+                    text="Rivedi, personalizza e approva i messaggi in attesa."
                     actions={
                       <Badge tone="pending">{pending} da approvare</Badge>
                     }
                   />
                   <div className="info-strip">
                     <ShieldCheck size={18} />
-                    Modificare una bozza annulla l’approvazione. Ogni nuovo
-                    messaggio richiede il tuo consenso.
+                    Modificare una bozza annulla l’approvazione. Le campagne
+                    seguono il livello di autonomia che hai autorizzato.
                     {meta?.demo_mode && " Gli invii qui sono simulati."}
                   </div>
                   {!data.drafts.length ? (
@@ -1111,7 +1173,7 @@ export default function App() {
                   <PageHeader
                     eyebrow="CONTINUITÀ SENZA PRESSIONE"
                     title="Il prossimo passo, al momento giusto"
-                    text="I follow-up generano bozze: nessun invio automatico senza approvazione."
+                    text="I follow-up seguono le regole della campagna. Le bozze in attesa richiedono la tua approvazione."
                     actions={
                       <Button
                         variant="secondary"
@@ -1384,7 +1446,7 @@ export default function App() {
                           email: {
                             name: "Email",
                             icon: <Mail size={25} />,
-                            desc: "Invio dopo approvazione, con protezione dai duplicati.",
+                            desc: "Invio approvato o autorizzato dalle regole della campagna, con protezione dai duplicati.",
                           },
                           search: {
                             name: "Ricerca lead",
@@ -1404,7 +1466,7 @@ export default function App() {
                           voice: {
                             name: "Modulo telefonico",
                             icon: <Phone size={25} />,
-                            desc: "Modulo separato predisposto. Le telefonate non sono ancora implementate.",
+                            desc: "Telefonate reali non collegate. Nelle Automazioni AI puoi simulare una trascrizione demo e farla analizzare al Sales Agent.",
                           },
                         };
                         const details = config[key] || {
@@ -1627,6 +1689,14 @@ export default function App() {
               </h3>
               {lead.qualification ? (
                 <>
+                  {lead.qualification.product_fit != null && (
+                    <div className="qualification-metrics">
+                      <div><span>Product fit</span><strong>{lead.qualification.product_fit}<small>/100</small></strong></div>
+                      <div><span>Potenziale commerciale</span><strong>{lead.qualification.commercial_potential ?? "—"}<small>/100</small></strong></div>
+                      <div><span>Confidenza</span><strong>{lead.qualification.confidence ?? "—"}<small>/100</small></strong></div>
+                      <div><span>Score totale</span><strong>{lead.qualification.total_score ?? lead.score ?? "—"}<small>/100</small></strong></div>
+                    </div>
+                  )}
                   <p>{lead.qualification.summary}</p>
                   <FactList
                     title="Fatti nei dati disponibili"
@@ -2332,7 +2402,10 @@ function DashboardPage({
   newLead: () => void;
 }) {
   const m = data.dashboard.metrics;
-  const pipeline = Object.keys(stages).map((stage) => ({
+  const pipeline = Object.keys(stages).filter(stage =>
+    ["new", "qualified", "contacted", "interested", "appointment", "won", "lost"].includes(stage) ||
+    data.dashboard.pipeline.some(item => item.stage === stage && item.count > 0)
+  ).map((stage) => ({
     stage,
     count:
       data.dashboard.pipeline.find((item) => item.stage === stage)?.count || 0,
@@ -2411,6 +2484,11 @@ function DashboardPage({
             <strong>Relazioni di valore.</strong>
           </span>
         </div>
+      </section>
+      <section className="dashboard-automation-callout">
+        <span className="dashboard-automation-icon"><Sparkles size={27} strokeWidth={1.5} /></span>
+        <div><span className="eyebrow">IL TUO SISTEMA COMMERCIALE AI</span><h3>Guarda il tuo team di agenti al lavoro.</h3><p>Avvia una campagna, segui le opportunità e intervieni quando la relazione passa a te.</p></div>
+        <Button onClick={() => go("automations")}><Sparkles size={16} />Apri Automazioni AI<ArrowRight size={16} /></Button>
       </section>
       <div className="metric-grid">
         {metricCards.map((item) => (

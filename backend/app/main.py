@@ -7,7 +7,7 @@ import io
 import json
 import re
 import logging
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select, update, func, exists
@@ -19,6 +19,9 @@ from .auth import hash_password, verify_password, token
 from . import schemas as S
 from . import services as svc
 from . import integrations as adapters
+from . import automation as auto
+from .automation_routes import register_automation_routes
+from .automation_models import Campaign
 from .seed import seed, DEMO_LEADS
 
 logger = logging.getLogger('agro')
@@ -42,14 +45,14 @@ def create_app(settings=None):
         yield
         engine.dispose()
 
-    app = FastAPI(title='Agro Sales AI', version='1.0.0', lifespan=lifespan)
+    app = FastAPI(title='Agro Sales AI', version='2.0.0', lifespan=lifespan)
     app.state.settings, app.state.engine, app.state.sessions = settings, engine, sessions
     app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins, allow_methods=['GET', 'POST', 'PUT', 'PATCH'], allow_headers=['Authorization', 'Content-Type'])
 
     def db():
         with sessions() as session:
             yield session
-    def current(credentials: HTTPAuthorizationCredentials = Depends(bearer), session=Depends(db)):
+    def current(request: Request, credentials: HTTPAuthorizationCredentials = Depends(bearer), session=Depends(db)):
         try:
             if credentials is None:
                 raise ValueError()
@@ -57,6 +60,9 @@ def create_app(settings=None):
             user = session.get(User, int(payload['sub']))
             if not user:
                 raise ValueError()
+            if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'} and session.scalar(select(Campaign.id).where(Campaign.producer_id == user.producer_id).limit(1)):
+                # Match worker lock ordering before any authenticated state change.
+                session.execute(update(Producer).where(Producer.id == user.producer_id).values(profile=Producer.profile))
             return user
         except (jwt.PyJWTError, ValueError, TypeError):
             raise HTTPException(401, 'Accesso richiesto: effettua il login.', headers={'WWW-Authenticate': 'Bearer'})
@@ -265,8 +271,13 @@ def create_app(settings=None):
     @app.patch('/api/leads/{lead_id}')
     def patch_lead(lead_id: int, body: S.LeadPatch, user=Depends(current), session=Depends(db)):
         lead = own(session, Lead, lead_id, user)
+        old_stage = lead.stage
+        if body.stage in {'won', 'lost', 'do_not_contact'}:
+            svc.stop_contact(session, user.producer_id, lead, body.stage)
         for key, value in body.model_dump(exclude_none=True).items():
             setattr(lead, key, value)
+        if old_stage != lead.stage:
+            auto.on_stage_changed(session, user.producer_id, lead, old_stage)
         svc.audit(session, user.producer_id, 'lead.aggiornato', 'Pipeline o note aggiornate dall’operatore.', lead.id)
         session.commit()
         return output(session, lead)
@@ -316,6 +327,13 @@ def create_app(settings=None):
     @app.post('/api/leads/{lead_id}/reply')
     def reply(lead_id: int, body: S.Reply, user=Depends(current), session=Depends(db)):
         lead = own(session, Lead, lead_id, user)
+        if auto.campaign_for_lead(session, user.producer_id, lead.id):
+            result = auto.ingest_response(session, user.producer_id, lead, body.body, event=body.event, subject=body.subject, settings=settings, external_event_id=body.external_event_id)
+            # Keep the existing response vocabulary; campaign consumers also get the richer sales class.
+            sales_class = result['classification']
+            result['sales_classification'] = sales_class
+            result['classification'] = {'NOT_INTERESTED': 'rejection', 'MEETING_REQUEST': 'question', 'OBJECTION': 'question', 'OUT_OF_OFFICE': 'other'}.get(sales_class, sales_class.lower())
+            return result
         classification = svc.classify(body.body, body.event)
         event = classification['classification']
         terminal = event in {'rejection', 'unsubscribe', 'hard_bounce'}
@@ -397,6 +415,7 @@ def create_app(settings=None):
         draft = own(session, Draft, draft_id, user)
         if draft.task_id:
             session.get(Task, draft.task_id).status = 'cancelled'
+        auto.on_draft_rejected(session, user.producer_id, draft)
         svc.audit(session, user.producer_id, 'bozza.rifiutata', 'Bozza rifiutata dall’operatore.', draft.lead_id)
         session.commit()
         return output(session, draft)
@@ -407,6 +426,7 @@ def create_app(settings=None):
         lead = own(session, Lead, draft.lead_id, user)
         if draft.status == 'sent':
             return output(session, draft)
+        auto.campaign_send_guard(session, user.producer_id, draft, settings)
         if blocked(lead, draft.kind):
             fail(session, user, 'invio.bloccato', 'Ricontatti interrotti: ' + lead.stop_reason, lead.id)
         if not lead.email:
@@ -423,7 +443,7 @@ def create_app(settings=None):
         session.commit()
         session.refresh(draft)
         try:
-            sent = adapters.send_email(settings, lead.email, draft.subject, draft.body, draft.idempotency_key)
+            sent = auto.email_provider(settings).send(lead.email, draft.subject, draft.body, draft.idempotency_key)
         except adapters.IntegrationError as error:
             draft.status, draft.error = 'failed', str(error)
             svc.audit(session, user.producer_id, 'invio.errore', str(error) + ' Eventuale retry usa la stessa chiave, testo immutabile.', lead.id)
@@ -434,6 +454,7 @@ def create_app(settings=None):
         # Reload after provider latency. A reply/stop received in the meantime stays authoritative.
         sent_lead_id = draft.lead_id
         session.expire_all()
+        session.execute(update(Producer).where(Producer.id == user.producer_id).values(profile=Producer.profile))
         lead = session.scalar(select(Lead).where(Lead.id == sent_lead_id, Lead.producer_id == user.producer_id).with_for_update().execution_options(populate_existing=True))
         draft = own(session, Draft, draft_id, user)
         draft.status, draft.sent_at, draft.error = 'sent', now(), ''
@@ -441,11 +462,12 @@ def create_app(settings=None):
         session.add(Message(producer_id=user.producer_id, lead_id=lead.id, draft_id=draft.id, direction='outbound', subject=draft.subject, body=draft.body, simulated=sent['simulated']))
         if draft.task_id:
             session.get(Task, draft.task_id).status = 'completed'
-        elif draft.kind == 'outreach' and not lead.stop_reason:
+        elif draft.kind == 'outreach' and not lead.stop_reason and not auto.campaign_for_lead(session, user.producer_id, lead.id):
             svc.schedule_followups(session, user.producer_id, lead, profile(session, user))
         if lead.stage in {'new', 'qualified'}:
             lead.stage = 'contacted'
         svc.audit(session, user.producer_id, 'invio.simulato' if sent['simulated'] else 'email.inviata', 'Registrazione demo, nessuna email reale.' if sent['simulated'] else 'Provider email ha confermato l’invio.', lead.id)
+        auto.on_draft_sent(session, user.producer_id, draft, settings)
         session.commit()
         return output(session, draft)
 
@@ -459,6 +481,7 @@ def create_app(settings=None):
         if task.status == 'completed':
             raise HTTPException(409, 'Attività già completata.')
         task.status = 'cancelled'
+        auto.cancel_followup(session, user.producer_id, task)
         session.execute(update(Draft).where(Draft.task_id == task.id, Draft.status.in_(['pending', 'approved'])).values(status='cancelled'))
         svc.audit(session, user.producer_id, 'attività.annullata', 'Attività annullata dall’operatore.', task.lead_id)
         session.commit()
@@ -466,7 +489,9 @@ def create_app(settings=None):
 
     @app.post('/api/worker/run')
     def worker(user=Depends(current), session=Depends(db)):
-        return svc.run_due(session, user.producer_id)
+        result = svc.run_due(session, user.producer_id)
+        result['automation'] = auto.run_due(session, settings, tenant=user.producer_id)
+        return result
 
     @app.get('/api/conversations')
     def conversations(user=Depends(current), session=Depends(db)):
@@ -487,7 +512,7 @@ def create_app(settings=None):
         data = {'lead_id': lead.id, 'title': body.title, 'start_at': start.isoformat(), 'end_at': end.isoformat()}
         key = hashlib.sha256(f'{user.producer_id}:{json.dumps(data, sort_keys=True)}'.encode()).hexdigest()
         # Producer row write serializes booking creation and overlap check, also on SQLite.
-        session.execute(update(Producer).where(Producer.id == user.producer_id).values(id=Producer.id))
+        session.execute(update(Producer).where(Producer.id == user.producer_id).values(profile=Producer.profile))
         appointment = session.scalar(select(Appointment).where(Appointment.booking_key == key, Appointment.producer_id == user.producer_id))
         if appointment and appointment.status in {'simulated', 'confirmed'}:
             session.rollback()
@@ -509,10 +534,18 @@ def create_app(settings=None):
             svc.audit(session, user.producer_id, 'calendario.errore', str(error) + ' Nessun appuntamento confermato.', lead.id)
             session.commit()
             raise HTTPException(503, str(error))
+        # A stop/unsubscribe received while the provider was booking remains authoritative.
+        session.expire_all()
+        session.execute(update(Producer).where(Producer.id == user.producer_id).values(profile=Producer.profile))
+        lead = session.scalar(select(Lead).where(Lead.id == body.lead_id, Lead.producer_id == user.producer_id).with_for_update().execution_options(populate_existing=True))
+        appointment = own(session, Appointment, appointment.id, user)
         appointment.provider_event_id, appointment.simulated = result['provider_event_id'], result['simulated']
         appointment.status = 'simulated' if result['simulated'] else 'confirmed'
-        lead.stage = 'appointment'
+        if lead.stop_reason in {'', 'reply'}:
+            svc.stop_contact(session, user.producer_id, lead, 'meeting')
+            lead.stage = 'appointment'
         svc.audit(session, user.producer_id, 'appuntamento.simulato' if result['simulated'] else 'appuntamento.confermato', 'Evento solo demo.' if result['simulated'] else 'Prenotazione riuscita sul provider calendario.', lead.id)
+        auto.on_booking(session, user.producer_id, lead, appointment, settings)
         session.commit()
         return output(session, appointment)
 
@@ -550,9 +583,10 @@ def create_app(settings=None):
         tenant = user.producer_id
         def count(model, *conditions):
             return session.scalar(select(func.count()).select_from(model).where(model.producer_id == tenant, *conditions))
-        metrics = {'leads': count(Lead), 'qualified': count(Lead, Lead.score.is_not(None)), 'pending_drafts': count(Draft, Draft.status.in_(['pending', 'approved'])), 'scheduled_tasks': count(Task, Task.status.in_(['scheduled', 'needs_approval'])), 'appointments': count(Appointment, Appointment.status.in_(['simulated', 'confirmed'])), 'sent_real': count(Message, Message.direction == 'outbound', Message.simulated == False), 'sent_demo': count(Message, Message.direction == 'outbound', Message.simulated == True), 'replies': count(Message, Message.direction == 'inbound')}
-        return {'metrics': metrics, 'pipeline': [{'stage': stage, 'count': total} for stage, total in session.execute(select(Lead.stage, func.count()).where(Lead.producer_id == tenant).group_by(Lead.stage))], 'recent_activity': many(session, Audit, user)[:8], 'upcoming_tasks': [output(session, item) for item in session.scalars(select(Task).where(Task.producer_id == tenant, Task.status.in_(['scheduled', 'needs_approval'])).order_by(Task.due_at).limit(6)).all()]}
+        metrics = {'leads': count(Lead), 'qualified': count(Lead, Lead.score.is_not(None)), 'pending_drafts': count(Draft, Draft.status.in_(['pending', 'approved'])), 'scheduled_tasks': count(Task, Task.status.in_(['scheduled', 'needs_approval', 'automation_managed'])), 'appointments': count(Appointment, Appointment.status.in_(['simulated', 'confirmed'])), 'sent_real': count(Message, Message.direction == 'outbound', Message.simulated == False), 'sent_demo': count(Message, Message.direction == 'outbound', Message.simulated == True), 'replies': count(Message, Message.direction == 'inbound')}
+        return {'metrics': metrics, 'pipeline': [{'stage': stage, 'count': total} for stage, total in session.execute(select(Lead.stage, func.count()).where(Lead.producer_id == tenant).group_by(Lead.stage))], 'recent_activity': many(session, Audit, user)[:8], 'upcoming_tasks': [output(session, item) for item in session.scalars(select(Task).where(Task.producer_id == tenant, Task.status.in_(['scheduled', 'needs_approval', 'automation_managed'])).order_by(Task.due_at).limit(6)).all()]}
 
+    register_automation_routes(app, db, current, settings)
     return app
 
 app = create_app()

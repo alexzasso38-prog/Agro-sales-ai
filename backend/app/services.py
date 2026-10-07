@@ -119,9 +119,12 @@ def create_draft(session, tenant, lead, profile, kind='outreach', task_id=None, 
 
 def stop_contact(session, tenant, lead, reason):
     lead.stop_reason = reason
-    session.execute(update(Task).where(Task.producer_id == tenant, Task.lead_id == lead.id, Task.status.in_(['scheduled', 'processing', 'needs_approval'])).values(status='cancelled'))
+    session.execute(update(Task).where(Task.producer_id == tenant, Task.lead_id == lead.id, Task.status.in_(['scheduled', 'processing', 'needs_approval', 'automation_managed'])).values(status='cancelled'))
     session.execute(update(Draft).where(Draft.producer_id == tenant, Draft.lead_id == lead.id, Draft.kind == 'outreach', Draft.status.in_(['pending', 'approved', 'failed'])).values(status='cancelled'))
     audit(session, tenant, 'ricontatti.interrotti', reason, lead.id)
+    # A manual stop, inbound reply or bounce also stops persisted agent jobs.
+    from .automation import on_contact_stopped
+    on_contact_stopped(session, tenant, lead)
 
 def run_due(session, tenant=None):
     where = [Task.status == 'scheduled', Task.due_at <= now()]

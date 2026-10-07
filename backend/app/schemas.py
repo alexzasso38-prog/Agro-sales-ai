@@ -73,7 +73,7 @@ class LeadInput(Strict):
         return value.strip()
 
 class LeadPatch(Strict):
-    stage: Literal['new', 'qualified', 'contacted', 'interested', 'appointment', 'won', 'lost'] | None = None
+    stage: Literal['new', 'discovered', 'qualifying', 'qualified', 'low_priority', 'outreach_ready', 'contacted', 'follow_up', 'replied', 'interested', 'meeting', 'appointment', 'handoff', 'won', 'lost', 'do_not_contact'] | None = None
     notes: str | None = Field(default=None, max_length=10000)
 
 class Search(Strict):
@@ -92,6 +92,7 @@ class Reply(Strict):
     body: str = Field(min_length=1, max_length=30000)
     subject: str = Field(default='', max_length=500)
     event: Literal['reply', 'rejection', 'unsubscribe', 'hard_bounce'] = 'reply'
+    external_event_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 class Stop(Strict):
     reason: str = Field(min_length=1, max_length=1000)
